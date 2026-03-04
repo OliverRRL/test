@@ -37,8 +37,8 @@ supabase: Client = create_client(
 claude = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 CATEGORIES = ["LinkedIn Bio", "Dating Profile", "Business Pitch", "Cover Letter", "Social Bio"]
-REACTIONS = ["💀", "🔥", "🤌", "😬", "🫡", "😭"]
-REACTION_WEIGHTS = {"💀": 10, "🔥": 8, "🤌": 9, "😬": 6, "🫡": 4, "😭": 7}
+REACTIONS = ["💀", "🔥", "😈", "😬", "👏", "😭"]
+REACTION_WEIGHTS = {"💀": 10, "🔥": 8, "😈": 9, "😬": 6, "👏": 4, "😭": 7}
 
 INPUT_MAX_CHARS = 1200
 COOLDOWN_SECONDS = 45
@@ -248,3 +248,67 @@ async def leaderboard():
         "top_reactions": top_reactions.data,
         "most_recent": most_recent.data
     }
+
+
+# ── Lemon Squeezy ─────────────────────────────────────────────────────────────
+import hmac
+import hashlib
+import secrets
+
+LS_WEBHOOK_SECRET = os.getenv("LEMONSQUEEZY_WEBHOOK_SECRET", "")
+
+# In-memory token store: {token: order_id}
+# Fine for MVP — tokens persist until server restart
+# In production: move to Supabase table
+_unlock_tokens: dict[str, str] = {}
+
+
+@app.post("/api/webhooks/lemonsqueezy")
+async def ls_webhook(request: Request):
+    """
+    Lemon Squeezy sends a POST here on successful payment.
+    We verify the signature, generate a token, store it.
+
+    In Lemon Squeezy dashboard:
+    Settings → Webhooks → Add webhook
+    URL: https://your-render-url/api/webhooks/lemonsqueezy
+    Events: order_created
+    """
+    body = await request.body()
+    sig = request.headers.get("x-signature", "")
+
+    # Verify webhook signature
+    if LS_WEBHOOK_SECRET:
+        expected = hmac.new(
+            LS_WEBHOOK_SECRET.encode(),
+            body,
+            hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(expected, sig):
+            raise HTTPException(401, "Invalid signature")
+
+    payload = await request.json()
+    event = payload.get("meta", {}).get("event_name")
+
+    if event == "order_created":
+        order_id = str(payload.get("data", {}).get("id", ""))
+        status = payload.get("data", {}).get("attributes", {}).get("status")
+
+        if status == "paid" and order_id:
+            token = secrets.token_urlsafe(32)
+            _unlock_tokens[token] = order_id
+            # Token is now valid — frontend polls /api/verify-token?token=xxx
+            # after returning from checkout
+
+    return {"ok": True}
+
+
+@app.get("/api/verify-token")
+async def verify_token(token: str):
+    """
+    Frontend calls this after returning from Lemon Squeezy checkout.
+    If token is valid (webhook already fired), returns unlocked: true.
+    """
+    if token and token in _unlock_tokens:
+        return {"unlocked": True, "order_id": _unlock_tokens[token]}
+    return {"unlocked": False}
